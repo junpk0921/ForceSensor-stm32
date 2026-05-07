@@ -2,6 +2,7 @@
 #include <Wire.h>
 #include <math.h>
 #include <EEPROM.h>
+#include <string.h>
 #include "HX711.h"
 
 // [ 하드웨어 설정 ]
@@ -20,21 +21,27 @@ TwoWire Wire2(PB11, PB10);
 // [ EEPROM 저장 주소 ]
 #define EEPROM_MAGIC_ADDR     0
 #define EEPROM_FACTOR_ADDR    4
-#define EEPROM_MAGIC_VALUE    0x46534341UL   // 'FSCA' Force Sensor Calibration
+#define EEPROM_MAGIC_VALUE    0x46534341UL   // 'FSCA'
 
 // [ 보정 계수 유효 범위 ]
 #define CAL_FACTOR_MIN        50.0f
 #define CAL_FACTOR_MAX        5000.0f
 
-// [ 데이터 프로토콜 ] - 10Byte
+// [ 출력/계산 상수 ]
+const float G_CONST = 9.80665f;
+const float DEADBAND_WEIGHT = 0.5f;   // g
+const float DEADBAND_ACCEL  = 0.01f;  // g
+
+// [ 데이터 프로토콜 ] - 14Byte
 typedef union {
   struct __attribute__((packed)) {
-    int32_t weight_g100;       
-    int16_t accX_g1000;     
-    int16_t accY_g1000;     
-    int16_t accZ_g1000;     
+    int32_t weight_g100;      // g x 100
+    int32_t force_N1000;      // N x 1000
+    int16_t accX_g1000;       // g x 1000
+    int16_t accY_g1000;       // g x 1000
+    int16_t accZ_g1000;       // g x 1000
   } val;
-  uint8_t buffer[10];      
+  uint8_t buffer[14];
 } Packet_t;
 
 HX711 scale;
@@ -50,6 +57,11 @@ float prev_weight = 0.0f;
 float prev_gx = 0.0f;
 float prev_gy = 0.0f;
 float prev_gz = 0.0f;
+
+// STM32 내부 가속도 offset
+float offset_gx = 0.0f;
+float offset_gy = 0.0f;
+float offset_gz = 0.0f;
 
 unsigned long lastUpdateTime = 0;
 const unsigned long INTERVAL = 10; // 100Hz
@@ -90,6 +102,66 @@ void saveCalibrationFactor(float factor) {
 }
 
 // ------------------------------------------------------------
+// ADXL345 1회 읽기
+// ------------------------------------------------------------
+bool readADXL345(float &gx, float &gy, float &gz) {
+  Wire2.beginTransmission(ADXL_ADDR);
+  Wire2.write(0x32);
+
+  if (Wire2.endTransmission(false) != 0) {
+    return false;
+  }
+
+  Wire2.requestFrom(ADXL_ADDR, (uint8_t)6);
+
+  if (Wire2.available() != 6) {
+    return false;
+  }
+
+  int16_t ax_raw = (Wire2.read() | (Wire2.read() << 8));
+  int16_t ay_raw = (Wire2.read() | (Wire2.read() << 8));
+  int16_t az_raw = (Wire2.read() | (Wire2.read() << 8));
+
+  gx = ax_raw / 256.0f;
+  gy = ay_raw / 256.0f;
+  gz = az_raw / 256.0f;
+
+  return true;
+}
+
+// ------------------------------------------------------------
+// STM32 내부 가속도 offset 보정
+// 부팅 시 현재 자세를 기준점으로 저장
+// ------------------------------------------------------------
+void calibrateAccelOffset() {
+  float sum_gx = 0.0f;
+  float sum_gy = 0.0f;
+  float sum_gz = 0.0f;
+
+  int valid_samples = 0;
+  const int samples = 50;
+
+  for (int i = 0; i < samples; i++) {
+    float gx, gy, gz;
+
+    if (readADXL345(gx, gy, gz)) {
+      sum_gx += gx;
+      sum_gy += gy;
+      sum_gz += gz;
+      valid_samples++;
+    }
+
+    delay(5);
+  }
+
+  if (valid_samples > 0) {
+    offset_gx = sum_gx / valid_samples;
+    offset_gy = sum_gy / valid_samples;
+    offset_gz = sum_gz / valid_samples;
+  }
+}
+
+// ------------------------------------------------------------
 // EZMAKER에서 I2C Write 명령 수신
 // CMD_SAVE_CALIB_RATIO + float correction_ratio, 총 5바이트
 // ------------------------------------------------------------
@@ -111,25 +183,22 @@ void onI2CReceive(int numBytes) {
     pending_calibration_save = true;
   }
 
-  // 남은 바이트 버림
   while (Wire.available()) {
     Wire.read();
   }
 }
 
 // ------------------------------------------------------------
-// EZMAKER에서 I2C Read 요청 시 센서 패킷 전송
+// EZMAKER에서 I2C Read 요청 시 최종 계산 패킷 전송
 // ------------------------------------------------------------
 void onI2CRequest() {
-  Wire.write((const uint8_t*)txData.buffer, 10);
+  Wire.write((const uint8_t*)txData.buffer, 14);
 
-  // I2C 요청 확인용 LED 토글
   digitalWrite(STATUS_LED, !digitalRead(STATUS_LED));
 }
 
 // ------------------------------------------------------------
 // 보정 저장 요청 처리
-// Flash/EEPROM 저장은 인터럽트 콜백 안에서 하지 않고 loop()에서 처리
 // ------------------------------------------------------------
 void processCalibrationSaveRequest() {
   if (!pending_calibration_save) {
@@ -152,23 +221,14 @@ void processCalibrationSaveRequest() {
     return;
   }
 
-  // 기존 EZMAKER 방식:
-  // corrected_weight = measured_weight * correction_ratio
-  //
-  // HX711 scale factor 관점:
-  // new_factor = old_factor / correction_ratio
   float new_factor = base_calibration_factor / correction_ratio;
 
   if (new_factor >= CAL_FACTOR_MIN && new_factor <= CAL_FACTOR_MAX) {
     base_calibration_factor = new_factor;
 
-    // 즉시 적용
     scale.set_scale(base_calibration_factor);
-
-    // 영구 저장
     saveCalibrationFactor(base_calibration_factor);
 
-    // 저장 확인용 LED 빠르게 2회 점멸
     for (int i = 0; i < 2; i++) {
       digitalWrite(STATUS_LED, HIGH);
       delay(80);
@@ -212,6 +272,11 @@ void setup() {
   Wire2.write(0x08);
   Wire2.endTransmission();
 
+  delay(100);
+
+  // STM32 내부에서 가속도 offset 보정
+  calibrateAccelOffset();
+
   // I2C Slave 시작
   Wire.begin(I2C_SLAVE_ADDR);    
   Wire.onRequest(onI2CRequest);
@@ -219,46 +284,54 @@ void setup() {
 }
 
 void loop() {
-  // EZMAKER에서 요청한 보정 계수 저장 처리
   processCalibrationSaveRequest();
 
   unsigned long currentTime = millis();
 
-  // 센서 업데이트 100Hz
   if (currentTime - lastUpdateTime >= INTERVAL) {
     lastUpdateTime = currentTime;
 
-    // 1. ADXL345 읽기
-    Wire2.beginTransmission(ADXL_ADDR);
-    Wire2.write(0x32);
+    // 1. ADXL345 읽기 및 필터
+    float gx, gy, gz;
 
-    if (Wire2.endTransmission(false) == 0) {
-      Wire2.requestFrom(ADXL_ADDR, 6);  
+    if (readADXL345(gx, gy, gz)) {
+      prev_gx = alpha_sync * gx + (1.0f - alpha_sync) * prev_gx;
+      prev_gy = alpha_sync * gy + (1.0f - alpha_sync) * prev_gy;
+      prev_gz = alpha_sync * gz + (1.0f - alpha_sync) * prev_gz;
+    }
 
-      if (Wire2.available() == 6) {
-        int16_t ax_raw = (Wire2.read() | (Wire2.read() << 8));
-        int16_t ay_raw = (Wire2.read() | (Wire2.read() << 8));
-        int16_t az_raw = (Wire2.read() | (Wire2.read() << 8));
-
-        prev_gx = alpha_sync * (ax_raw / 256.0f) + (1.0f - alpha_sync) * prev_gx;
-        prev_gy = alpha_sync * (ay_raw / 256.0f) + (1.0f - alpha_sync) * prev_gy;
-        prev_gz = alpha_sync * (az_raw / 256.0f) + (1.0f - alpha_sync) * prev_gz;
-      }
-    } 
-
-    // 2. HX711 읽기
+    // 2. HX711 읽기 및 필터
     if (scale.is_ready()) {
       float raw_weight = -scale.get_units(1);  
       prev_weight = alpha_sync * raw_weight + (1.0f - alpha_sync) * prev_weight;
     }
 
-    // 3. I2C 전송 패킷 갱신
+    // 3. STM32 내부에서 최종값 계산
+    float weight_g = prev_weight;
+
+    if (fabs(weight_g) < DEADBAND_WEIGHT) {
+      weight_g = 0.0f;
+    }
+
+    float weight_kg = weight_g / 1000.0f;
+    float force_N = weight_kg * G_CONST;
+
+    float accX_g = -((prev_gx) - offset_gx);
+    float accY_g = -((prev_gy) - offset_gy);
+    float accZ_g = -((prev_gz) - offset_gz);
+
+    if (fabs(accX_g) < DEADBAND_ACCEL) accX_g = 0.0f;
+    if (fabs(accY_g) < DEADBAND_ACCEL) accY_g = 0.0f;
+    if (fabs(accZ_g) < DEADBAND_ACCEL) accZ_g = 0.0f;
+
+    // 4. I2C 전송 패킷 갱신
     noInterrupts();
 
-    txData.val.weight_g100 = (int32_t)roundf(prev_weight * 100.0f);
-    txData.val.accX_g1000 = (int16_t)(prev_gx * 1000.0f);
-    txData.val.accY_g1000 = (int16_t)(prev_gy * 1000.0f);
-    txData.val.accZ_g1000 = (int16_t)(prev_gz * 1000.0f);
+    txData.val.weight_g100 = (int32_t)roundf(weight_g * 100.0f);
+    txData.val.force_N1000 = (int32_t)roundf(force_N * 1000.0f);
+    txData.val.accX_g1000 = (int16_t)roundf(accX_g * 1000.0f);
+    txData.val.accY_g1000 = (int16_t)roundf(accY_g * 1000.0f);
+    txData.val.accZ_g1000 = (int16_t)roundf(accZ_g * 1000.0f);
 
     interrupts();
   }
