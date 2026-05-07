@@ -7,7 +7,7 @@
 TwoWire Wire2(PB11, PB10); 
 #define HX_DOUT   PA1     
 #define HX_SCK    PA0     
-#define CALIB_BUTTON PA3  
+#define CALIB_BUTTON D0  
 #define STATUS_LED   PA8     
 #define I2C_SLAVE_ADDR 0x08
 #define ADXL_ADDR      0x53
