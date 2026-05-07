@@ -5,34 +5,32 @@
 #include <string.h>
 #include "HX711.h"
 
-// [ 하드웨어 설정 ]
-TwoWire Wire2(PB11, PB10); 
+/* ================= [ 하드웨어 설정 ] ================= */
+TwoWire Wire2(PB11, PB10); // ADXL345 전용 I2C 
 
 #define HX_DOUT      PA1     
 #define HX_SCK       PA0     
 #define STATUS_LED   PA8     
 
-#define I2C_SLAVE_ADDR 0x08
-#define ADXL_ADDR      0x53
+#define I2C_SLAVE_ADDR 0x08  
+#define ADXL_ADDR      0x53  
 
-// [ EZMAKER -> STM32 명령 ]
+/* ================= [ 명령 및 EEPROM 설정 ] ================= */
 #define CMD_SAVE_CALIB_RATIO  0xC1
 
-// [ EEPROM 저장 주소 ]
 #define EEPROM_MAGIC_ADDR     0
 #define EEPROM_FACTOR_ADDR    4
 #define EEPROM_MAGIC_VALUE    0x46534341UL   // 'FSCA'
 
-// [ 보정 계수 유효 범위 ]
 #define CAL_FACTOR_MIN        50.0f
 #define CAL_FACTOR_MAX        5000.0f
 
-// [ 출력/계산 상수 ]
+/* ================= [ 계산 상수 ] ================= */
 const float G_CONST = 9.80665f;
 const float DEADBAND_WEIGHT = 0.5f;   // g
 const float DEADBAND_ACCEL  = 0.01f;  // g
 
-// [ 데이터 프로토콜 ] - 14Byte
+/* ================= [ I2C 전송 패킷 - 14Byte ] ================= */
 typedef union {
   struct __attribute__((packed)) {
     int32_t weight_g100;      // g x 100
@@ -44,13 +42,12 @@ typedef union {
   uint8_t buffer[14];
 } Packet_t;
 
+/* ================= [ 전역 변수 ] ================= */
 HX711 scale;
-
 volatile Packet_t txData; 
 
 const float alpha_sync = 0.3f;
 
-// 기본 보정 계수
 float base_calibration_factor = 400.3f;
 
 float prev_weight = 0.0f;           
@@ -58,7 +55,6 @@ float prev_gx = 0.0f;
 float prev_gy = 0.0f;
 float prev_gz = 0.0f;
 
-// STM32 내부 가속도 offset
 float offset_gx = 0.0f;
 float offset_gy = 0.0f;
 float offset_gz = 0.0f;
@@ -66,13 +62,10 @@ float offset_gz = 0.0f;
 unsigned long lastUpdateTime = 0;
 const unsigned long INTERVAL = 10; // 100Hz
 
-// EZMAKER에서 받은 보정 비율 저장 요청
 volatile bool pending_calibration_save = false;
 volatile uint8_t pending_ratio_bytes[4];
 
-// ------------------------------------------------------------
-// EEPROM에서 보정 계수 불러오기
-// ------------------------------------------------------------
+/* ================= [ EEPROM 보정 계수 로드 ] ================= */
 void loadCalibrationFactor() {
   uint32_t magic = 0;
   float saved_factor = 0.0f;
@@ -87,9 +80,7 @@ void loadCalibrationFactor() {
   }
 }
 
-// ------------------------------------------------------------
-// EEPROM에 보정 계수 저장
-// ------------------------------------------------------------
+/* ================= [ EEPROM 보정 계수 저장 ] ================= */
 void saveCalibrationFactor(float factor) {
   if (factor < CAL_FACTOR_MIN || factor > CAL_FACTOR_MAX) {
     return;
@@ -101,9 +92,7 @@ void saveCalibrationFactor(float factor) {
   EEPROM.put(EEPROM_FACTOR_ADDR, factor);
 }
 
-// ------------------------------------------------------------
-// ADXL345 1회 읽기
-// ------------------------------------------------------------
+/* ================= [ ADXL345 데이터 읽기 ] ================= */
 bool readADXL345(float &gx, float &gy, float &gz) {
   Wire2.beginTransmission(ADXL_ADDR);
   Wire2.write(0x32);
@@ -129,10 +118,7 @@ bool readADXL345(float &gx, float &gy, float &gz) {
   return true;
 }
 
-// ------------------------------------------------------------
-// STM32 내부 가속도 offset 보정
-// 부팅 시 현재 자세를 기준점으로 저장
-// ------------------------------------------------------------
+/* ================= [ 가속도 초기 offset 보정 ] ================= */
 void calibrateAccelOffset() {
   float sum_gx = 0.0f;
   float sum_gy = 0.0f;
@@ -161,10 +147,7 @@ void calibrateAccelOffset() {
   }
 }
 
-// ------------------------------------------------------------
-// EZMAKER에서 I2C Write 명령 수신
-// CMD_SAVE_CALIB_RATIO + float correction_ratio, 총 5바이트
-// ------------------------------------------------------------
+/* ================= [ I2C 수신 롤백 ] ================= */
 void onI2CReceive(int numBytes) {
   if (numBytes < 5) {
     while (Wire.available()) Wire.read();
@@ -179,7 +162,6 @@ void onI2CReceive(int numBytes) {
         pending_ratio_bytes[i] = Wire.read();
       }
     }
-
     pending_calibration_save = true;
   }
 
@@ -188,18 +170,14 @@ void onI2CReceive(int numBytes) {
   }
 }
 
-// ------------------------------------------------------------
-// EZMAKER에서 I2C Read 요청 시 최종 계산 패킷 전송
-// ------------------------------------------------------------
+/* ================= [ I2C 요청 롤백 ] ================= */
 void onI2CRequest() {
   Wire.write((const uint8_t*)txData.buffer, 14);
 
   digitalWrite(STATUS_LED, !digitalRead(STATUS_LED));
 }
 
-// ------------------------------------------------------------
-// 보정 저장 요청 처리
-// ------------------------------------------------------------
+/* ================= [ 보정 저장 요청 처리 ] ================= */
 void processCalibrationSaveRequest() {
   if (!pending_calibration_save) {
     return;
@@ -208,10 +186,12 @@ void processCalibrationSaveRequest() {
   uint8_t ratio_bytes[4];
 
   noInterrupts();
+  
   for (int i = 0; i < 4; i++) {
     ratio_bytes[i] = pending_ratio_bytes[i];
   }
   pending_calibration_save = false;
+
   interrupts();
 
   float correction_ratio = 1.0f;
@@ -238,10 +218,10 @@ void processCalibrationSaveRequest() {
   }
 }
 
+/* ================= [ 초기 설정 ] ================= */
 void setup() {
   pinMode(STATUS_LED, OUTPUT);
 
-  // 부팅 표시
   for (int i = 0; i < 3; i++) {
     digitalWrite(STATUS_LED, HIGH);
     delay(100);
@@ -249,40 +229,33 @@ void setup() {
     delay(100);
   }
 
-  // 저장된 HX711 보정 계수 불러오기
   loadCalibrationFactor();
 
-  // HX711 초기화
   scale.begin(HX_DOUT, HX_SCK);
   scale.set_scale(base_calibration_factor);  
   scale.tare(10); 
 
-  // ADXL345 초기화
   Wire2.begin();
-
-  // 100Hz 출력 설정
   Wire2.beginTransmission(ADXL_ADDR);
   Wire2.write(0x2C);
-  Wire2.write(0x0A);
+  Wire2.write(0x0A);   // 100Hz
   Wire2.endTransmission();
 
-  // 측정 모드 설정
   Wire2.beginTransmission(ADXL_ADDR);
   Wire2.write(0x2D);
-  Wire2.write(0x08);
+  Wire2.write(0x08);   // 측정 모드
   Wire2.endTransmission();
 
   delay(100);
 
-  // STM32 내부에서 가속도 offset 보정
   calibrateAccelOffset();
 
-  // I2C Slave 시작
   Wire.begin(I2C_SLAVE_ADDR);    
   Wire.onRequest(onI2CRequest);
   Wire.onReceive(onI2CReceive);
 }
 
+/* ================= [ 메인 루프 ] ================= */
 void loop() {
   processCalibrationSaveRequest();
 
@@ -291,7 +264,6 @@ void loop() {
   if (currentTime - lastUpdateTime >= INTERVAL) {
     lastUpdateTime = currentTime;
 
-    // 1. ADXL345 읽기 및 필터
     float gx, gy, gz;
 
     if (readADXL345(gx, gy, gz)) {
@@ -300,13 +272,11 @@ void loop() {
       prev_gz = alpha_sync * gz + (1.0f - alpha_sync) * prev_gz;
     }
 
-    // 2. HX711 읽기 및 필터
     if (scale.is_ready()) {
       float raw_weight = -scale.get_units(1);  
       prev_weight = alpha_sync * raw_weight + (1.0f - alpha_sync) * prev_weight;
     }
 
-    // 3. STM32 내부에서 최종값 계산
     float weight_g = prev_weight;
 
     if (fabs(weight_g) < DEADBAND_WEIGHT) {
@@ -324,15 +294,12 @@ void loop() {
     if (fabs(accY_g) < DEADBAND_ACCEL) accY_g = 0.0f;
     if (fabs(accZ_g) < DEADBAND_ACCEL) accZ_g = 0.0f;
 
-    // 4. I2C 전송 패킷 갱신
     noInterrupts();
-
     txData.val.weight_g100 = (int32_t)roundf(weight_g * 100.0f);
     txData.val.force_N1000 = (int32_t)roundf(force_N * 1000.0f);
     txData.val.accX_g1000 = (int16_t)roundf(accX_g * 1000.0f);
     txData.val.accY_g1000 = (int16_t)roundf(accY_g * 1000.0f);
     txData.val.accZ_g1000 = (int16_t)roundf(accZ_g * 1000.0f);
-
     interrupts();
   }
 }
